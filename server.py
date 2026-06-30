@@ -68,7 +68,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(CONFIG_DIR / "line_secretary.log"),
+        *([logging.FileHandler(CONFIG_DIR / "line_secretary.log")]
+          if CONFIG_DIR.exists() else []),
     ]
 )
 logger = logging.getLogger(__name__)
