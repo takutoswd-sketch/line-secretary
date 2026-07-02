@@ -25,7 +25,7 @@ from linebot.v3.messaging import (
     PushMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, AudioMessageContent
+from linebot.v3.webhooks import MessageEvent, AudioMessageContent, TextMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
 
 # ─────────────────────────────────────────
@@ -125,6 +125,12 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             background_tasks.add_task(_push, user_id, "🎙️ 音声を解析中...\n議事録ができたらお送りします")
             background_tasks.add_task(process_voice_to_minutes, msg_id, user_id)
 
+        elif isinstance(msg, TextMessageContent):
+            user_id = event.source.user_id
+            text = msg.text
+            logger.info(f"Text message: user={user_id}, text={text[:50]}")
+            background_tasks.add_task(process_text_message, text, user_id)
+
     return JSONResponse({"status": "ok"})
 
 
@@ -156,6 +162,37 @@ def process_voice_to_minutes(message_id: str, user_id: str):
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
+        _push(user_id, f"⚠️ エラーが発生しました\n{str(e)}")
+
+
+SYSTEM_PROMPT = """あなたは澤田拓人専用のLINE秘書AIです。
+澤田拓人について：建築設計事務所とAIコンサルとして独立。売上目標1000万円。
+主な仕事は建築デザイン、AIコンサル、アプリ開発、現場監督。
+note・Instagram・X（Twitter）でSNS発信中。
+
+返答スタイル：
+- LINEのチャットなので短く簡潔に
+- 結論から先に
+- 敬語不要、フランクに
+- 箇条書きより会話調で"""
+
+def process_text_message(text: str, user_id: str):
+    """テキストメッセージをClaudeで処理して返信"""
+    try:
+        today = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+        msg = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"[{today}]\n{text}"
+            }]
+        )
+        reply = msg.content[0].text
+        _push(user_id, reply)
+    except Exception as e:
+        logger.error(f"Text processing error: {e}", exc_info=True)
         _push(user_id, f"⚠️ エラーが発生しました\n{str(e)}")
 
 
