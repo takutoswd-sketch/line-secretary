@@ -87,7 +87,7 @@ app = FastAPI(title="LINE秘書")
 
 @app.get("/")
 def health():
-    return {"status": "LINE秘書 稼働中 🤖", "time": datetime.now().isoformat()}
+    return {"status": "LINE秘書 稼働中 🤖", "version": "text-chat-v2", "time": datetime.now().isoformat()}
 
 
 @app.post("/webhook")
