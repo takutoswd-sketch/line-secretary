@@ -103,6 +103,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac", ".mp4"}
+    MAC_SERVER_URL = os.environ.get("MAC_SERVER_URL", "").rstrip("/")
 
     for event in events:
         msg = getattr(event, "message", None)
@@ -125,6 +126,15 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             logger.info(f"Audio detected! user={user_id}, msg={msg_id}, type={msg_type}")
             background_tasks.add_task(_push, user_id, "🎙️ 音声を解析中...\n議事録ができたらお送りします")
             background_tasks.add_task(process_voice_to_minutes, msg_id, user_id)
+
+        elif msg_type == "video":
+            user_id = event.source.user_id
+            msg_id  = msg.id
+            logger.info(f"Video detected! user={user_id}, msg={msg_id}")
+            if MAC_SERVER_URL:
+                background_tasks.add_task(forward_video_to_mac, msg_id, user_id, MAC_SERVER_URL)
+            else:
+                background_tasks.add_task(_push, user_id, "⚠️ 動画処理サーバー未設定（MAC_SERVER_URL）")
 
         elif msg_type == "text":
             user_id = event.source.user_id
@@ -195,6 +205,21 @@ def process_text_message(text: str, user_id: str):
     except Exception as e:
         logger.error(f"Text processing error: {e}", exc_info=True)
         _broadcast(f"⚠️ エラーが発生しました\n{str(e)}")
+
+
+def forward_video_to_mac(message_id: str, user_id: str, mac_url: str):
+    """動画処理タスクをMacローカルサーバーに転送"""
+    try:
+        with httpx.Client(timeout=10) as client:
+            res = client.post(
+                f"{mac_url}/process-video",
+                json={"message_id": message_id, "user_id": user_id},
+            )
+            res.raise_for_status()
+        logger.info(f"動画タスク転送完了 → {mac_url}")
+    except Exception as e:
+        logger.error(f"Mac転送エラー: {e}")
+        _push(user_id, f"⚠️ 動画処理サーバーに接続できませんでした\n（Macのvideo_processorは起動していますか？）")
 
 
 def _download_audio(message_id: str) -> str:
