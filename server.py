@@ -190,10 +190,10 @@ def process_text_message(text: str, user_id: str):
             }]
         )
         reply = msg.content[0].text
-        _push(user_id, reply)
+        _broadcast(reply)
     except Exception as e:
         logger.error(f"Text processing error: {e}", exc_info=True)
-        _push(user_id, f"⚠️ エラーが発生しました\n{str(e)}")
+        _broadcast(f"⚠️ エラーが発生しました\n{str(e)}")
 
 
 def _download_audio(message_id: str) -> str:
@@ -265,6 +265,15 @@ def _reply(reply_token: str, text: str):
         MessagingApi(api).reply_message(
             ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text)])
         )
+
+def _broadcast(text: str):
+    url = "https://api.line.me/v2/bot/message/broadcast"
+    token = LINE_TOKEN.encode("ascii", errors="ignore").decode("ascii")
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"messages": [{"type": "text", "text": text}]}
+    with httpx.Client(timeout=30) as client:
+        res = client.post(url, headers=headers, json=payload)
+        res.raise_for_status()
 
 def _push(user_id: str, text: str):
     url = "https://api.line.me/v2/bot/message/push"
