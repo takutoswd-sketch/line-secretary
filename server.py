@@ -87,15 +87,8 @@ app = FastAPI(title="LINE秘書")
 
 @app.get("/")
 def health():
-    return {"status": "LINE秘書 稼働中 🤖", "version": "text-chat-v3", "time": datetime.now().isoformat()}
+    return {"status": "LINE秘書 稼働中 🤖", "time": datetime.now().isoformat()}
 
-@app.get("/test-broadcast")
-def test_broadcast():
-    try:
-        _broadcast("🔧 テストbroadcast from Railway")
-        return {"result": "ok"}
-    except Exception as e:
-        return {"result": "error", "detail": str(e)}
 
 
 @app.post("/webhook")
