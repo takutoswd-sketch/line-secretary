@@ -125,9 +125,9 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             background_tasks.add_task(_push, user_id, "🎙️ 音声を解析中...\n議事録ができたらお送りします")
             background_tasks.add_task(process_voice_to_minutes, msg_id, user_id)
 
-        elif isinstance(msg, TextMessageContent):
+        elif msg_type == "text":
             user_id = event.source.user_id
-            text = msg.text
+            text = getattr(msg, "text", "")
             logger.info(f"Text message: user={user_id}, text={text[:50]}")
             background_tasks.add_task(process_text_message, text, user_id)
 
