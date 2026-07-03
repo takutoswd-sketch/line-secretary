@@ -89,3 +89,53 @@ function getOrCreateFolder_(parent, name) {
   const it = parent.getFoldersByName(name);
   return it.hasNext() ? it.next() : parent.createFolder(name);
 }
+
+// ─────────────────────────────────────────
+// LINE送信キュー（毎分トリガーで実行）
+// スケジュールタスクがDriveの「LINE送信キュー」フォルダに置いた
+// テキストファイルをLINEにpushして「LINE送信済み」フォルダへ移動する
+// 必要なスクリプトプロパティ: LINE_TOKEN, LINE_USER_ID
+// ─────────────────────────────────────────
+
+const QUEUE_FOLDER_ID = "1xULMkqx-vVmgWMiDUVrYzg73Jkj5U4Rt"; // LINE送信キュー
+const SENT_FOLDER_NAME = "LINE送信済み";
+
+function sendQueuedLineMessages() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty("LINE_TOKEN");
+  const uid = props.getProperty("LINE_USER_ID");
+  if (!token || !uid) {
+    console.error("LINE_TOKEN / LINE_USER_ID がスクリプトプロパティに未設定");
+    return;
+  }
+  const queue = DriveApp.getFolderById(QUEUE_FOLDER_ID);
+  const sent = getOrCreateFolder_(DriveApp.getRootFolder(), SENT_FOLDER_NAME);
+  const files = queue.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    try {
+      let text = "";
+      const mime = f.getMimeType();
+      if (mime === "application/vnd.google-apps.document") {
+        text = DocumentApp.openById(f.getId()).getBody().getText().trim();
+      } else {
+        text = f.getBlob().getDataAsString("UTF-8").trim();
+      }
+      if (text) {
+        const res = UrlFetchApp.fetch("https://api.line.me/v2/bot/message/push", {
+          method: "post",
+          contentType: "application/json",
+          headers: { Authorization: "Bearer " + token },
+          payload: JSON.stringify({ to: uid, messages: [{ type: "text", text: text.substring(0, 4900) }] }),
+          muteHttpExceptions: true
+        });
+        console.log("LINE push:", f.getName(), res.getResponseCode());
+      }
+      f.moveTo(sent);
+    } catch (err) {
+      console.error("送信失敗:", f.getName(), err);
+      f.setName("ERROR_" + f.getName());
+      f.moveTo(sent);
+    }
+  }
+}
