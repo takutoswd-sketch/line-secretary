@@ -10,7 +10,14 @@ import tempfile
 import logging
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
+
+JST = ZoneInfo("Asia/Tokyo")
+
+def now_jst() -> datetime:
+    """日本時間の現在時刻（サーバーはUTCで動いているため必ずこれを使う）"""
+    return datetime.now(JST)
 
 import httpx
 import openai
@@ -60,6 +67,8 @@ LINE_TOKEN          = _read_token()
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+NOTIFY_KEY          = os.environ.get("NOTIFY_KEY", "").strip()
+LINE_USER_ID        = os.environ.get("LINE_USER_ID", "").strip()
 
 # ─────────────────────────────────────────
 # クライアント初期化
@@ -89,8 +98,23 @@ app = FastAPI(title="LINE秘書")
 
 @app.get("/")
 def health():
-    return {"status": "LINE秘書 稼働中 🤖", "time": datetime.now().isoformat()}
+    return {"status": "LINE秘書 稼働中 🤖", "time": now_jst().isoformat()}
 
+
+
+@app.get("/notify")
+def notify(key: str = "", text: str = ""):
+    """スケジュールタスク等からのLINE通知中継（GET）。
+    実行環境からLINE APIへ直接アクセスできないため、このサーバーが中継する。"""
+    if not NOTIFY_KEY or key != NOTIFY_KEY:
+        raise HTTPException(status_code=403, detail="invalid key")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text required")
+    if not LINE_USER_ID:
+        raise HTTPException(status_code=500, detail="LINE_USER_ID not set")
+    _push(LINE_USER_ID, text[:4900])
+    logger.info(f"Notify sent ({len(text)} chars)")
+    return {"status": "sent"}
 
 
 @app.post("/webhook")
@@ -199,7 +223,7 @@ note・Instagram・X（Twitter）でSNS発信中。
 def process_text_message(text: str, user_id: str):
     """テキストメッセージをClaudeで処理して返信"""
     try:
-        today = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+        today = now_jst().strftime("%Y年%m月%d日 %H:%M")
         msg = claude_client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
@@ -260,7 +284,7 @@ def _transcribe(audio_path: str) -> str:
 
 def _format_minutes(transcript: str) -> str:
     """Claude で議事録に整形（LINEのスマホ表示向け）"""
-    today = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+    today = now_jst().strftime("%Y年%m月%d日 %H:%M")
 
     msg = claude_client.messages.create(
         model="claude-haiku-4-5-20251001",
