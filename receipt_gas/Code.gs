@@ -8,7 +8,8 @@
  */
 
 const SHEET_NAME = "経費";           // 記帳先シート名
-const DRIVE_FOLDER_NAME = "レシート画像"; // 画像保存フォルダ名（Driveに自動作成）
+const DRIVE_FOLDER_NAME = "レシート画像"; // 画像保存フォルダ名（経費フォルダ内に自動作成）
+const EXPENSE_PARENT_ID = "1qQgTGANItb149jb-IICENpAfGH5EA6uP"; // マイドライブ/siki archidesign/経費
 
 function doPost(e) {
   try {
@@ -65,7 +66,7 @@ function doPost(e) {
 
 /** レシート画像をDriveの「レシート画像/年」フォルダに保存し、URLを返す */
 function saveImage_(data) {
-  const root = getOrCreateFolder_(DriveApp.getRootFolder(), DRIVE_FOLDER_NAME);
+  const root = getOrCreateFolder_(DriveApp.getFolderById(EXPENSE_PARENT_ID), DRIVE_FOLDER_NAME);
   const year = (data.date || "").substring(0, 4) || String(new Date().getFullYear());
   const yearFolder = getOrCreateFolder_(root, year);
 
@@ -88,6 +89,26 @@ function saveImage_(data) {
 function getOrCreateFolder_(parent, name) {
   const it = parent.getFoldersByName(name);
   return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+/**
+ * 一度だけ手動実行: 既存の経費帳スプレッドシートとレシート画像フォルダを
+ * マイドライブ直下 → siki archidesign/経費 へ移動する
+ */
+function migrateReceiptData() {
+  const dest = DriveApp.getFolderById(EXPENSE_PARENT_ID);
+  // スプレッドシート本体
+  const ssFile = DriveApp.getFileById(SpreadsheetApp.getActiveSpreadsheet().getId());
+  ssFile.moveTo(dest);
+  console.log("経費帳を移動:", ssFile.getName());
+  // レシート画像フォルダ（マイドライブ直下にある場合）
+  const it = DriveApp.getRootFolder().getFoldersByName(DRIVE_FOLDER_NAME);
+  while (it.hasNext()) {
+    const f = it.next();
+    f.moveTo(dest);
+    console.log("フォルダを移動:", f.getName());
+  }
+  console.log("移動完了");
 }
 
 // ─────────────────────────────────────────
