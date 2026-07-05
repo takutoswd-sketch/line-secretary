@@ -12,4 +12,4 @@ RUN pip install -r requirements.txt --no-cache-dir
 COPY . .
 
 # Railway は $PORT を自動設定する
-CMD uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]
