@@ -19,12 +19,16 @@ def now_jst() -> datetime:
     """日本時間の現在時刻（サーバーはUTCで動いているため必ずこれを使う）"""
     return datetime.now(JST)
 
+import subprocess
+import threading
+import time
+
 import httpx
 import openai
 import anthropic
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from linebot.v3 import WebhookParser
 from linebot.v3.messaging import (
     Configuration,
@@ -69,6 +73,11 @@ OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 NOTIFY_KEY          = os.environ.get("NOTIFY_KEY", "").strip()
 LINE_USER_ID        = os.environ.get("LINE_USER_ID", "").strip()
+RAILWAY_DOMAIN      = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+
+# 動画一時保存ディレクトリ（Railway の /tmp は再起動でリセットされる）
+VIDEO_TMP_DIR = Path("/tmp/line_videos")
+VIDEO_TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────
 # クライアント初期化
@@ -101,6 +110,16 @@ def health():
     return {"status": "LINE秘書 稼働中 🤖", "time": now_jst().isoformat()}
 
 
+@app.get("/video/{filename}")
+def serve_video(filename: str):
+    """動画・サムネイルファイルを一時提供（LINE動画メッセージ用）"""
+    path = VIDEO_TMP_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    media_type = "video/mp4" if filename.endswith(".mp4") else "image/jpeg"
+    return FileResponse(str(path), media_type=media_type)
+
+
 
 @app.get("/notify")
 def notify(key: str = "", text: str = ""):
@@ -129,7 +148,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".ogg", ".flac", ".mp4"}
-    MAC_SERVER_URL = os.environ.get("MAC_SERVER_URL", "").rstrip("/")
 
     for event in events:
         msg = getattr(event, "message", None)
@@ -157,10 +175,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             user_id = event.source.user_id
             msg_id  = msg.id
             logger.info(f"Video detected! user={user_id}, msg={msg_id}")
-            if MAC_SERVER_URL:
-                background_tasks.add_task(forward_video_to_mac, msg_id, user_id, MAC_SERVER_URL)
-            else:
-                background_tasks.add_task(_push, user_id, "⚠️ 動画処理サーバー未設定（MAC_SERVER_URL）")
+            background_tasks.add_task(process_video_on_railway, msg_id, user_id)
 
         elif msg_type == "image":
             user_id = event.source.user_id
@@ -240,19 +255,131 @@ def process_text_message(text: str, user_id: str):
         _broadcast(f"⚠️ エラーが発生しました\n{str(e)}")
 
 
-def forward_video_to_mac(message_id: str, user_id: str, mac_url: str):
-    """動画処理タスクをMacローカルサーバーに転送"""
+def process_video_on_railway(message_id: str, user_id: str):
+    """動画をRailway上でffmpegによってreel変換してLINE返信"""
     try:
-        with httpx.Client(timeout=10) as client:
-            res = client.post(
-                f"{mac_url}/process-video",
-                json={"message_id": message_id, "user_id": user_id},
-            )
-            res.raise_for_status()
-        logger.info(f"動画タスク転送完了 → {mac_url}")
+        if not RAILWAY_DOMAIN:
+            _push(user_id, "⚠️ RAILWAY_PUBLIC_DOMAIN が未設定です")
+            return
+
+        _push(user_id, "🎬 動画を受信しました。リール変換中...")
+
+        # 1. ダウンロード
+        input_path = _download_video(message_id)
+
+        # 2. reel変換（9:16・ぼかし背景・カラーグレード）
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_name   = f"reel_{ts}.mp4"
+        thumb_name = f"thumb_{ts}.jpg"
+        out_path   = str(VIDEO_TMP_DIR / out_name)
+        thumb_path = str(VIDEO_TMP_DIR / thumb_name)
+
+        _reel_convert(input_path, out_path)
+        _extract_video_thumbnail(out_path, thumb_path)
+
+        # 3. LINE に動画送信
+        base = f"https://{RAILWAY_DOMAIN}"
+        _push_video(user_id,
+                    f"{base}/video/{out_name}",
+                    f"{base}/video/{thumb_name}")
+
+        # 4. 入力削除・出力は10分後に削除
+        os.unlink(input_path)
+        _schedule_delete([out_path, thumb_path], delay=600)
+        logger.info(f"動画処理完了: {out_name}")
+
     except Exception as e:
-        logger.error(f"Mac転送エラー: {e}")
-        _push(user_id, f"⚠️ 動画処理サーバーに接続できませんでした\n（Macのvideo_processorは起動していますか？）")
+        logger.error(f"Video error: {e}", exc_info=True)
+        _push(user_id, f"⚠️ 動画処理エラー\n{str(e)}")
+
+
+def _download_video(message_id: str) -> str:
+    """LINE Content API から動画をダウンロード"""
+    url     = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
+    with httpx.Client(timeout=60) as client:
+        res = client.get(url, headers=headers)
+        res.raise_for_status()
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.write(res.content)
+    tmp.close()
+    logger.info(f"動画ダウンロード完了: {len(res.content)//1024}KB")
+    return tmp.name
+
+
+def _reel_convert(input_path: str, output_path: str):
+    """ffmpeg で9:16縦型リール変換（ぼかし背景 + カラーグレード）"""
+    vf = (
+        "[0:v]split[a][b];"
+        "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,gblur=sigma=30[bg];"
+        "[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+        "eq=contrast=1.08:brightness=0.02:saturation=1.12[out]"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-filter_complex", vf,
+        "-map", "[out]", "-map", "0:a?",
+        "-t", "60",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg失敗:\n{result.stderr[-500:]}")
+    logger.info(f"reel変換完了: {output_path}")
+
+
+def _extract_video_thumbnail(video_path: str, thumb_path: str):
+    """ffmpeg で1秒目フレームをサムネイルとして抽出"""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-ss", "00:00:01", "-vframes", "1", "-q:v", "3",
+        thumb_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError("サムネイル生成失敗")
+
+
+def _push_video(user_id: str, video_url: str, thumb_url: str):
+    """LINE に動画メッセージを送信"""
+    url     = "https://api.line.me/v2/bot/message/push"
+    token   = LINE_TOKEN.encode("ascii", errors="ignore").decode("ascii")
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "to": user_id,
+        "messages": [
+            {"type": "text", "text": "✅ リール変換完了！"},
+            {
+                "type": "video",
+                "originalContentUrl": video_url,
+                "previewImageUrl": thumb_url,
+            },
+        ],
+    }
+    with httpx.Client(timeout=30) as client:
+        res = client.post(url, headers=headers, json=payload)
+        res.raise_for_status()
+    logger.info(f"LINE動画送信完了: {video_url}")
+
+
+def _schedule_delete(paths: list, delay: int = 600):
+    """指定秒後にファイルを削除（バックグラウンドスレッド）"""
+    def _delete():
+        time.sleep(delay)
+        for p in paths:
+            try:
+                os.unlink(p)
+                logger.info(f"Cleaned up: {p}")
+            except Exception:
+                pass
+    threading.Thread(target=_delete, daemon=True).start()
 
 
 def _download_audio(message_id: str) -> str:
