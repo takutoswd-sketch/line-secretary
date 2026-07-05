@@ -606,5 +606,6 @@ def _push(user_id: str, text: str):
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    logger.info("LINE秘書 起動中... port 8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"LINE秘書 起動中... port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
