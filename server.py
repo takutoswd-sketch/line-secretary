@@ -23,6 +23,9 @@ import subprocess
 import threading
 import time
 
+import imageio_ffmpeg
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
 import httpx
 import openai
 import anthropic
@@ -318,7 +321,7 @@ def _reel_convert(input_path: str, output_path: str):
         "eq=contrast=1.08:brightness=0.02:saturation=1.12[out]"
     )
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG, "-y",
         "-i", input_path,
         "-filter_complex", vf,
         "-map", "[out]", "-map", "0:a?",
@@ -337,7 +340,7 @@ def _reel_convert(input_path: str, output_path: str):
 def _extract_video_thumbnail(video_path: str, thumb_path: str):
     """ffmpeg で1秒目フレームをサムネイルとして抽出"""
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG, "-y",
         "-i", video_path,
         "-ss", "00:00:01", "-vframes", "1", "-q:v", "3",
         thumb_path,
