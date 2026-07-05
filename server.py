@@ -311,22 +311,18 @@ def _download_video(message_id: str) -> str:
 
 
 def _reel_convert(input_path: str, output_path: str):
-    """ffmpeg で9:16縦型リール変換（ぼかし背景 + カラーグレード）"""
+    """ffmpeg で9:16縦型リール変換（黒帯パディング・軽量処理）"""
     vf = (
-        "[0:v]split[a][b];"
-        "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,gblur=sigma=30[bg];"
-        "[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-        "eq=contrast=1.08:brightness=0.02:saturation=1.12[out]"
+        "scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
+        "eq=contrast=1.05:saturation=1.1"
     )
     cmd = [
         FFMPEG, "-y",
         "-i", input_path,
-        "-filter_complex", vf,
-        "-map", "[out]", "-map", "0:a?",
+        "-vf", vf,
         "-t", "60",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
         output_path,
