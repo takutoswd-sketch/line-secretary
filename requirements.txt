@@ -6,3 +6,4 @@ anthropic==0.34.0
 line-bot-sdk==3.11.0
 python-dotenv==1.0.0
 imageio-ffmpeg==0.5.1
+pillow==10.4.0

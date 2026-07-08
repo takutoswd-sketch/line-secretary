@@ -217,7 +217,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             user_id = event.source.user_id
             msg_id  = msg.id
             logger.info(f"Video detected! user={user_id}, msg={msg_id}")
-            background_tasks.add_task(process_video_on_railway, msg_id, user_id)
+            background_tasks.add_task(queue_video, msg_id, user_id)
 
         elif msg_type == "image":
             user_id = event.source.user_id
@@ -230,7 +230,10 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             user_id = event.source.user_id
             text = getattr(msg, "text", "")
             logger.info(f"Text message: user={user_id}, text={text[:50]}")
-            background_tasks.add_task(process_text_message, text, user_id)
+            if text.strip() in ("変換", "結合", "へんかん", "けつごう"):
+                background_tasks.add_task(flush_pending_videos, user_id)
+            else:
+                background_tasks.add_task(process_text_message, text, user_id)
 
     return JSONResponse({"status": "ok"})
 
@@ -297,72 +300,267 @@ def process_text_message(text: str, user_id: str):
         _broadcast(f"⚠️ エラーが発生しました\n{str(e)}")
 
 
-def _try_mac_process(message_id: str, user_id: str) -> bool:
-    """Mac（video_processor.py port8001）に処理を委譲。成功したらTrue。
-    Macはロゴ・フックテキスト・BGM入りのフル版reel変換を行い、LINE返信まで自前で実施する。"""
-    if not MAC_SERVER_URL:
-        logger.info("MAC_SERVER_URL未設定 → Railwayで簡易変換")
-        return False
-    try:
-        with httpx.Client(timeout=5) as client:
-            client.get(f"{MAC_SERVER_URL}/").raise_for_status()
-    except Exception as e:
-        logger.warning(f"Macサーバー未応答 → Railwayで簡易変換: {e}")
-        return False
-    try:
-        with httpx.Client(timeout=600) as client:
-            res = client.post(
-                f"{MAC_SERVER_URL}/process-video",
-                json={"message_id": message_id, "user_id": user_id},
-            )
-            res.raise_for_status()
-        logger.info("Mac側でreel変換完了（フル版）")
-        return True
-    except Exception as e:
-        logger.error(f"Mac処理失敗 → Railwayフォールバック: {e}")
-        return False
+
+# ─────────────────────────────────────────
+# 動画キュー（複数動画の結合対応）
+# 動画受信 → 90秒待機。追加が来れば束ねて、来なければそのまま変換。
+# テキスト「変換」「結合」で即時実行。
+# ─────────────────────────────────────────
+
+ASSETS_DIR = Path(__file__).parent / "assets"
+COLLECT_WINDOW = 90  # 秒
+
+_pending_videos: dict = {}   # user_id -> {"items": [(msg_id, path)], "timer": threading.Timer}
+_pending_lock = threading.Lock()
 
 
-def process_video_on_railway(message_id: str, user_id: str):
-    """動画処理。まずMac（フル版）へ委譲し、不可ならRailway上で簡易reel変換してLINE返信"""
-    # Macが生きていればフル版（ロゴ・フック・BGM入り）で処理
-    if _try_mac_process(message_id, user_id):
+def queue_video(message_id: str, user_id: str):
+    """動画をキューに追加し、90秒の待機タイマーを(再)設定する"""
+    try:
+        path = _download_video(message_id)
+    except Exception as e:
+        logger.error(f"動画DL失敗: {e}", exc_info=True)
+        _push(user_id, f"⚠️ 動画のダウンロードに失敗しました\n{str(e)}")
         return
 
+    with _pending_lock:
+        entry = _pending_videos.setdefault(user_id, {"items": [], "timer": None})
+        entry["items"].append((message_id, path))
+        n = len(entry["items"])
+        if entry["timer"]:
+            entry["timer"].cancel()
+        t = threading.Timer(COLLECT_WINDOW, flush_pending_videos, args=[user_id])
+        t.daemon = True
+        entry["timer"] = t
+        t.start()
+
+    if n == 1:
+        _push(user_id, "📥 動画を受け取りました（1本目）\n90秒以内に追加の動画を送ると1本のリールに結合します。\nすぐ変換する場合は「変換」と送ってください")
+    else:
+        _push(user_id, f"📥 {n}本目を受け取りました（結合予定）\n続けて送るか、「変換」で開始します")
+
+
+def flush_pending_videos(user_id: str):
+    """キューの動画をリール変換してLINE返信（1本ならそのまま、複数なら結合）"""
+    with _pending_lock:
+        entry = _pending_videos.pop(user_id, None)
+        if entry and entry["timer"]:
+            entry["timer"].cancel()
+
+    if not entry or not entry["items"]:
+        _push(user_id, "🤔 変換待ちの動画がありません。先に動画を送ってください")
+        return
+
+    items = entry["items"]
+    paths = [p for _, p in items]
     try:
         if not RAILWAY_DOMAIN:
             _push(user_id, "⚠️ RAILWAY_PUBLIC_DOMAIN が未設定です")
             return
 
-        _push(user_id, "🎬 動画を受信しました。リール変換中...（簡易版）")
+        label = f"{len(paths)}本を結合して" if len(paths) > 1 else ""
+        _push(user_id, f"🎬 {label}リール変換中...（ロゴ・キャプション・BGM入り）\n1〜3分ほどかかります")
 
-        # 1. ダウンロード
-        input_path = _download_video(message_id)
-
-        # 2. reel変換（9:16・ぼかし背景・カラーグレード）
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = now_jst().strftime("%Y%m%d_%H%M%S")
         out_name   = f"reel_{ts}.mp4"
         thumb_name = f"thumb_{ts}.jpg"
         out_path   = str(VIDEO_TMP_DIR / out_name)
         thumb_path = str(VIDEO_TMP_DIR / thumb_name)
 
-        _reel_convert(input_path, out_path)
+        src = paths[0] if len(paths) == 1 else _mix_segments(paths)
+        _reel_convert_full(src, out_path)
         _extract_video_thumbnail(out_path, thumb_path)
 
-        # 3. LINE に動画送信
         base = f"https://{RAILWAY_DOMAIN}"
         _push_video(user_id,
                     f"{base}/video/{out_name}",
                     f"{base}/video/{thumb_name}")
 
-        # 4. 入力削除・出力は10分後に削除
-        os.unlink(input_path)
+        for p in paths:
+            try: os.unlink(p)
+            except OSError: pass
+        if src not in paths:
+            try: os.unlink(src)
+            except OSError: pass
         _schedule_delete([out_path, thumb_path], delay=600)
-        logger.info(f"動画処理完了: {out_name}")
+        logger.info(f"動画処理完了: {out_name}（{len(paths)}本）")
 
     except Exception as e:
         logger.error(f"Video error: {e}", exc_info=True)
         _push(user_id, f"⚠️ 動画処理エラー\n{str(e)}")
+
+
+def _mix_segments(paths: list) -> str:
+    """複数動画から均等に切り出して1本に結合（shokunin mix方式・16秒）"""
+    n = min(len(paths), 4)
+    seg = 16.0 / n
+    tmp_dir = tempfile.mkdtemp(dir=str(VIDEO_TMP_DIR))
+    converted = []
+    for i, p in enumerate(paths[:n]):
+        conv = os.path.join(tmp_dir, f"clip_{i:03d}.mp4")
+        cmd = [FFMPEG, "-y", "-i", p, "-t", str(seg),
+               "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,"
+                      "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30",
+               "-threads", "2",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+               "-c:a", "aac", "-ar", "44100", "-ac", "2",
+               "-pix_fmt", "yuv420p", conv]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            raise RuntimeError(f"クリップ変換失敗({i+1}本目):\n{r.stderr[-300:]}")
+        converted.append(conv)
+
+    out = os.path.join(tmp_dir, "concat.mp4")
+    cmd = [FFMPEG, "-y"]
+    for c in converted:
+        cmd += ["-i", c]
+    fc = "".join(f"[{i}:v][{i}:a]" for i in range(len(converted)))
+    fc += f"concat=n={len(converted)}:v=1:a=1[vout][aout]"
+    cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "[aout]",
+            "-threads", "2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+            "-c:a", "aac", "-pix_fmt", "yuv420p", out]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(f"結合失敗:\n{r.stderr[-300:]}")
+    logger.info(f"結合完了: {len(converted)}本 × {seg:.1f}秒")
+    return out
+
+
+# ─────────────────────────────────────────
+# フル版リール変換（ロゴ・2段キャプション・BGM）
+# shokunin_editor.py v2.0 のreel処理をRailway向けに移植（720x1280）
+# ─────────────────────────────────────────
+
+def _find_jp_font():
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    for f in candidates:
+        if os.path.exists(f):
+            return f
+    return None
+
+
+def _load_hooks():
+    """assets/hooks.json からフック・サブテキストのペアを読む"""
+    try:
+        with open(ASSETS_DIR / "hooks.json", encoding="utf-8") as f:
+            pairs = json.load(f).get("hooks", [])
+        pairs = [(p["hook"], p["sub"]) for p in pairs if p.get("hook") and p.get("sub")]
+        if pairs:
+            return pairs
+    except Exception as e:
+        logger.warning(f"hooks.json読み込み失敗: {e}")
+    return [("見えない場所ほど、\n丁寧に。", "誰も見ない場所に\n技術者の思想が宿る")]
+
+
+def _make_overlays(w: int, h: int, tmp_dir: str):
+    """Pillowでロゴ・フック・サブのPNGオーバーレイを生成"""
+    import random as _random
+    import textwrap
+    from PIL import Image, ImageDraw, ImageFont
+
+    font_path = _find_jp_font()
+    hook_text, sub_text = _random.choice(_load_hooks())
+
+    # ロゴ（左上・高さ66px = 1080版の2/3スケール）
+    logo_png = os.path.join(tmp_dir, "logo.png")
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    logo_src = ASSETS_DIR / "logo_white.png"
+    if logo_src.exists():
+        logo = Image.open(logo_src).convert("RGBA")
+        lh = 66
+        lw = int(logo.width * lh / logo.height)
+        logo = logo.resize((lw, lh), Image.LANCZOS)
+        canvas.paste(logo, (27, 27), logo)
+    canvas.save(logo_png)
+
+    def _caption(text, font_size, filename):
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception:
+            font = ImageFont.load_default()
+        # 手動改行を優先しつつ16文字で折り返し
+        lines = []
+        for seg in text.split("\n"):
+            lines.extend(textwrap.wrap(seg, width=16) or [seg])
+        line_h = font_size + 6
+        total_h = len(lines) * line_h
+        ty = int(h * 0.40) - total_h // 2
+        for i, line in enumerate(lines):
+            bbox = draw.textbbox((0, 0), line, font=font)
+            tw = bbox[2] - bbox[0]
+            tx = (w - tw) // 2
+            cur_y = ty + i * line_h
+            pad = 10
+            draw.rectangle([tx - pad, cur_y - pad // 2,
+                            tx + tw + pad, cur_y + line_h - pad // 2 + pad],
+                           fill=(0, 0, 0, 110))
+            draw.text((tx + 2, cur_y + 2), line, font=font, fill=(0, 0, 0, 150))
+            draw.text((tx, cur_y), line, font=font, fill=(255, 255, 255, 240))
+        path = os.path.join(tmp_dir, filename)
+        img.save(path)
+        return path
+
+    hook_png = _caption(hook_text, 37, "hook.png")
+    sub_png  = _caption(sub_text, 27, "sub.png")
+    logger.info(f"フック: {hook_text.replace(chr(10), ' ')} / サブ: {sub_text.replace(chr(10), ' ')}")
+    return logo_png, hook_png, sub_png
+
+
+def _reel_convert_full(input_path: str, output_path: str):
+    """フル版reel変換: 9:16化 → カラーグレード → ロゴ常時 → フック(0-3s) → サブ(3-7s) → BGM"""
+    w, h = 720, 1280
+    tmp_dir = tempfile.mkdtemp(dir=str(VIDEO_TMP_DIR))
+    try:
+        logo_png, hook_png, sub_png = _make_overlays(w, h, tmp_dir)
+        bgm = ASSETS_DIR / "motohiko_bgm_reel_30s.mp3"
+        has_bgm = bgm.exists()
+
+        grade = ("eq=contrast=1.08:brightness=0.02:saturation=1.12,"
+                 "colorchannelmixer=rr=1.05:gg=1.0:bb=0.95,"
+                 "vignette=PI/5")
+
+        cmd = [FFMPEG, "-y", "-i", input_path,
+               "-i", logo_png, "-i", hook_png, "-i", sub_png]
+        if has_bgm:
+            cmd += ["-stream_loop", "-1", "-i", str(bgm)]
+
+        fc = (
+            f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,{grade}[graded];"
+            f"[graded][1:v]overlay=0:0[logo];"
+            f"[logo][2:v]overlay=0:0:enable='between(t,0,3)'[hook];"
+            f"[hook][3:v]overlay=0:0:enable='between(t,3,7)'[vout]"
+        )
+        if has_bgm:
+            fc += ";[4:a]volume=0.35[aout]"
+            cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "[aout]", "-shortest"]
+        else:
+            cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "0:a?"]
+
+        cmd += ["-t", "16", "-threads", "2",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                output_path]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpegタイムアウト（300秒超過）")
+        if result.returncode < 0:
+            raise RuntimeError(f"ffmpegが強制終了されました（signal {-result.returncode}）。メモリ不足の可能性")
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg失敗:\n{result.stderr[-500:]}")
+        logger.info(f"フル版reel変換完了: {output_path}")
+    finally:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _download_video(message_id: str) -> str:
@@ -378,38 +576,6 @@ def _download_video(message_id: str) -> str:
     logger.info(f"動画ダウンロード完了: {len(res.content)//1024}KB")
     return tmp.name
 
-
-def _reel_convert(input_path: str, output_path: str):
-    """ffmpeg で9:16縦型リール変換（黒帯パディング・軽量処理）
-    Railwayのメモリ制限でOOM killされるのを防ぐため720x1280・スレッド制限で変換する。"""
-    vf = (
-        "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,"
-        "eq=contrast=1.05:saturation=1.1"
-    )
-    cmd = [
-        FFMPEG, "-y",
-        "-i", input_path,
-        "-vf", vf,
-        "-t", "60",
-        "-threads", "2",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        output_path,
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("ffmpegタイムアウト（300秒超過）。動画が長すぎる可能性があります。")
-    if result.returncode < 0:
-        raise RuntimeError(
-            f"ffmpegが強制終了されました（signal {-result.returncode}）。"
-            "メモリ不足の可能性。短い動画で再送してください。"
-        )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg失敗:\n{result.stderr[-500:]}")
-    logger.info(f"reel変換完了: {output_path}")
 
 
 def _extract_video_thumbnail(video_path: str, thumb_path: str):
