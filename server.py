@@ -140,6 +140,44 @@ def notify(key: str = "", text: str = ""):
     return {"status": "sent"}
 
 
+@app.get("/job/transcribe")
+def job_transcribe(background_tasks: BackgroundTasks, key: str = "", name: str = ""):
+    """リポジトリ同梱の音声ファイル（transcribe_queue/）をWhisperで文字起こし（非同期）"""
+    if not NOTIFY_KEY or key != NOTIFY_KEY:
+        raise HTTPException(status_code=403, detail="invalid key")
+    audio = Path(__file__).parent / "transcribe_queue" / name
+    if not audio.exists():
+        raise HTTPException(status_code=404, detail=f"not found: {name}")
+    background_tasks.add_task(_transcribe_to_tmp, audio)
+    return {"status": "started", "file": name}
+
+
+def _transcribe_to_tmp(audio_path: Path):
+    out = Path("/tmp") / (audio_path.stem + ".txt")
+    try:
+        logger.info(f"Transcribing: {audio_path.name}")
+        with open(audio_path, "rb") as f:
+            text = openai_client.audio.transcriptions.create(
+                model="whisper-1", file=f, language="ja", response_format="text",
+            )
+        out.write_text(text)
+        logger.info(f"Transcribed: {len(text)} chars")
+    except Exception as e:
+        out.write_text(f"ERROR: {e}")
+        logger.error(f"Transcribe error: {e}", exc_info=True)
+
+
+@app.get("/job/result")
+def job_result(key: str = "", name: str = ""):
+    """文字起こし結果の取得"""
+    if not NOTIFY_KEY or key != NOTIFY_KEY:
+        raise HTTPException(status_code=403, detail="invalid key")
+    out = Path("/tmp") / (Path(name).stem + ".txt")
+    if not out.exists():
+        return {"status": "processing"}
+    return {"status": "done", "text": out.read_text()}
+
+
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     signature = request.headers.get("X-Line-Signature", "")
