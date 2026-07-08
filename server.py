@@ -77,6 +77,7 @@ ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 NOTIFY_KEY          = os.environ.get("NOTIFY_KEY", "").strip()
 LINE_USER_ID        = os.environ.get("LINE_USER_ID", "").strip()
 RAILWAY_DOMAIN      = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+MAC_SERVER_URL      = os.environ.get("MAC_SERVER_URL", "").strip().rstrip("/")
 
 # 動画一時保存ディレクトリ（Railway の /tmp は再起動でリセットされる）
 VIDEO_TMP_DIR = Path("/tmp/line_videos")
@@ -258,14 +259,44 @@ def process_text_message(text: str, user_id: str):
         _broadcast(f"⚠️ エラーが発生しました\n{str(e)}")
 
 
+def _try_mac_process(message_id: str, user_id: str) -> bool:
+    """Mac（video_processor.py port8001）に処理を委譲。成功したらTrue。
+    Macはロゴ・フックテキスト・BGM入りのフル版reel変換を行い、LINE返信まで自前で実施する。"""
+    if not MAC_SERVER_URL:
+        logger.info("MAC_SERVER_URL未設定 → Railwayで簡易変換")
+        return False
+    try:
+        with httpx.Client(timeout=5) as client:
+            client.get(f"{MAC_SERVER_URL}/").raise_for_status()
+    except Exception as e:
+        logger.warning(f"Macサーバー未応答 → Railwayで簡易変換: {e}")
+        return False
+    try:
+        with httpx.Client(timeout=600) as client:
+            res = client.post(
+                f"{MAC_SERVER_URL}/process-video",
+                json={"message_id": message_id, "user_id": user_id},
+            )
+            res.raise_for_status()
+        logger.info("Mac側でreel変換完了（フル版）")
+        return True
+    except Exception as e:
+        logger.error(f"Mac処理失敗 → Railwayフォールバック: {e}")
+        return False
+
+
 def process_video_on_railway(message_id: str, user_id: str):
-    """動画をRailway上でffmpegによってreel変換してLINE返信"""
+    """動画処理。まずMac（フル版）へ委譲し、不可ならRailway上で簡易reel変換してLINE返信"""
+    # Macが生きていればフル版（ロゴ・フック・BGM入り）で処理
+    if _try_mac_process(message_id, user_id):
+        return
+
     try:
         if not RAILWAY_DOMAIN:
             _push(user_id, "⚠️ RAILWAY_PUBLIC_DOMAIN が未設定です")
             return
 
-        _push(user_id, "🎬 動画を受信しました。リール変換中...")
+        _push(user_id, "🎬 動画を受信しました。リール変換中...（簡易版）")
 
         # 1. ダウンロード
         input_path = _download_video(message_id)
@@ -311,10 +342,11 @@ def _download_video(message_id: str) -> str:
 
 
 def _reel_convert(input_path: str, output_path: str):
-    """ffmpeg で9:16縦型リール変換（黒帯パディング・軽量処理）"""
+    """ffmpeg で9:16縦型リール変換（黒帯パディング・軽量処理）
+    Railwayのメモリ制限でOOM killされるのを防ぐため720x1280・スレッド制限で変換する。"""
     vf = (
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
+        "scale=720:1280:force_original_aspect_ratio=decrease,"
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,"
         "eq=contrast=1.05:saturation=1.1"
     )
     cmd = [
@@ -322,12 +354,21 @@ def _reel_convert(input_path: str, output_path: str):
         "-i", input_path,
         "-vf", vf,
         "-t", "60",
+        "-threads", "2",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ffmpegタイムアウト（300秒超過）。動画が長すぎる可能性があります。")
+    if result.returncode < 0:
+        raise RuntimeError(
+            f"ffmpegが強制終了されました（signal {-result.returncode}）。"
+            "メモリ不足の可能性。短い動画で再送してください。"
+        )
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg失敗:\n{result.stderr[-500:]}")
     logger.info(f"reel変換完了: {output_path}")
