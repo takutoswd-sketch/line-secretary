@@ -563,8 +563,34 @@ def _reel_convert_full(input_path: str, output_path: str):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _wait_for_content_ready(message_id: str, timeout: int = 60, interval: float = 1.5):
+    """動画/音声メッセージのトランスコード完了を待つ。
+    LINEはアップロード直後、content取得可能になるまで時間がかかることがあり、
+    準備前に取得すると壊れたファイルになるため、事前にステータスを確認する。"""
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content/transcoding"
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
+    elapsed = 0.0
+    with httpx.Client(timeout=30) as client:
+        while elapsed < timeout:
+            res = client.get(url, headers=headers)
+            if res.status_code == 200:
+                status = res.json().get("status")
+                if status == "succeeded":
+                    return
+                if status == "failed":
+                    raise RuntimeError("LINE側で動画の準備に失敗しました")
+                # "processing" ならもう少し待つ
+            else:
+                # このエンドポイント自体が404等を返す場合は準備不要とみなして先に進む
+                return
+            time.sleep(interval)
+            elapsed += interval
+    raise RuntimeError("動画の準備待ちがタイムアウトしました")
+
+
 def _download_video(message_id: str) -> str:
-    """LINE Content API から動画をダウンロード"""
+    """LINE Content API から動画をダウンロード（準備完了を待ってから取得）"""
+    _wait_for_content_ready(message_id)
     url     = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
     headers = {"Authorization": f"Bearer {LINE_TOKEN}"}
     with httpx.Client(timeout=60) as client:
