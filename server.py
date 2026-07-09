@@ -460,14 +460,88 @@ def _load_hooks():
     return [("見えない場所ほど、\n丁寧に。", "誰も見ない場所に\n技術者の思想が宿る")]
 
 
-def _make_overlays(w: int, h: int, tmp_dir: str):
+def _extract_frame_b64(video_path: str, ts: str = "00:00:01") -> str | None:
+    """動画から1フレーム抜き出してbase64(jpeg)にする（キャプション内容判定用）"""
+    tmp_jpg = video_path + ".frame.jpg"
+    try:
+        cmd = [FFMPEG, "-y", "-ss", ts, "-i", video_path, "-vframes", "1", "-q:v", "3", tmp_jpg]
+        r = subprocess.run(cmd, capture_output=True, timeout=20)
+        if r.returncode != 0 or not os.path.exists(tmp_jpg):
+            return None
+        with open(tmp_jpg, "rb") as f:
+            return base64.standard_b64encode(f.read()).decode("ascii")
+    except Exception as e:
+        logger.warning(f"フレーム抽出失敗: {e}")
+        return None
+    finally:
+        try: os.unlink(tmp_jpg)
+        except OSError: pass
+
+
+def _generate_contextual_caption(video_path: str):
+    """動画のフレームをClaude Visionに見せ、hooks.jsonと同じトーンで
+    実際の映像内容に合ったフック・サブテキストを生成する。
+    失敗した場合はNoneを返し、呼び出し側でランダム選択にフォールバックする。"""
+    frame_b64 = _extract_frame_b64(video_path)
+    if not frame_b64:
+        return None
+
+    examples = _load_hooks()[:6]
+    examples_text = "\n".join(f"- hook: {h.replace(chr(10),' / ')} / sub: {s.replace(chr(10),' / ')}"
+                               for h, s in examples)
+
+    prompt = f"""この画像は建築現場・施工の様子を撮影した動画の1フレームです。
+画像に写っている作業内容（何をしているか、どの部材か等）を踏まえて、
+SNSリール用のフックテキストとサブテキストを1組作ってください。
+
+トーン・文体は以下の既存例と同じにしてください（同じ雰囲気を踏襲、内容は画像に合わせる）：
+{examples_text}
+
+ルール：
+- hookは13〜16字程度で2行に収まるよう、適切な位置に \\n を1つ入れる
+- subは13〜16字程度で2行に収まるよう、適切な位置に \\n を1つ入れる
+- 画像から具体的に読み取れないなら、無理に決めつけず「施工・現場・丁寧さ」など一般的な職人トーンで書く
+- 出力はJSONのみ、説明文なし
+
+出力形式：
+{{"hook": "...", "sub": "..."}}"""
+
+    try:
+        msg = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        text = msg.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        data = json.loads(text.strip())
+        hook, sub = data.get("hook"), data.get("sub")
+        if hook and sub:
+            logger.info(f"映像内容に合わせたキャプション生成: {hook.replace(chr(10),' ')}")
+            return hook, sub
+    except Exception as e:
+        logger.warning(f"キャプション自動生成失敗、ランダム選択にフォールバック: {e}")
+    return None
+
+
+def _make_overlays(w: int, h: int, tmp_dir: str, video_path: str | None = None):
     """Pillowでロゴ・フック・サブのPNGオーバーレイを生成"""
     import random as _random
     import textwrap
     from PIL import Image, ImageDraw, ImageFont
 
     font_path = _find_jp_font()
-    hook_text, sub_text = _random.choice(_load_hooks())
+    contextual = _generate_contextual_caption(video_path) if video_path else None
+    hook_text, sub_text = contextual or _random.choice(_load_hooks())
 
     # ロゴ（左上・高さ66px = 1080版の2/3スケール）
     logo_png = os.path.join(tmp_dir, "logo.png")
@@ -524,7 +598,7 @@ def _reel_convert_full(input_path: str, output_path: str):
     w, h = 720, 1280
     tmp_dir = tempfile.mkdtemp(dir=str(VIDEO_TMP_DIR))
     try:
-        logo_png, hook_png, sub_png = _make_overlays(w, h, tmp_dir)
+        logo_png, hook_png, sub_png = _make_overlays(w, h, tmp_dir, input_path)
         bgm = ASSETS_DIR / "motohiko_bgm_reel_30s.mp3"
         has_bgm = bgm.exists()
 
