@@ -433,7 +433,10 @@ def _mix_segments(paths: list) -> str:
 # ─────────────────────────────────────────
 
 def _find_jp_font():
+    # リポジトリに同梱したフォントを最優先（apt側のNoto CJKが入っていない/パスが違う環境でも
+    # 確実に日本語キャプションが描画されるようにするため）
     candidates = [
+        str(ASSETS_DIR / "fonts" / "ipaexg.ttf"),
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -482,8 +485,11 @@ def _make_overlays(w: int, h: int, tmp_dir: str):
         img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         try:
+            if not font_path:
+                raise FileNotFoundError("日本語フォントが見つかりません")
             font = ImageFont.truetype(font_path, font_size)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"日本語フォント読み込み失敗、デフォルトフォントで代用（文字化けの原因）: {e}")
             font = ImageFont.load_default()
         # 手動改行を優先しつつ16文字で折り返し
         lines = []
