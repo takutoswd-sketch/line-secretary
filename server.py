@@ -547,6 +547,7 @@ def _reel_convert_full(input_path: str, output_path: str):
         cmd += ["-t", "16", "-threads", "2",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
                 output_path]
 
         try:
