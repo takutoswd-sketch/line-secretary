@@ -156,10 +156,7 @@ def _transcribe_to_tmp(audio_path: Path):
     out = Path("/tmp") / (audio_path.stem + ".txt")
     try:
         logger.info(f"Transcribing: {audio_path.name}")
-        with open(audio_path, "rb") as f:
-            text = openai_client.audio.transcriptions.create(
-                model="whisper-1", file=f, language="ja", response_format="text",
-            )
+        text = _transcribe(str(audio_path))  # 24MB超は自動で分割して起こす
         out.write_text(text)
         logger.info(f"Transcribed: {len(text)} chars")
     except Exception as e:
@@ -748,16 +745,79 @@ def _download_audio(message_id: str) -> str:
     return tmp.name
 
 
-def _transcribe(audio_path: str) -> str:
-    """OpenAI Whisper で日本語文字起こし"""
+# Whisper API の1リクエスト上限は25MB。安全側で24MBを直送の境界にする。
+_WHISPER_DIRECT_LIMIT = 24 * 1024 * 1024
+_CHUNK_SECONDS = 600   # 24MB超のときは10分ごとに分割（16kHz mono/64k ≒ 5MB/chunk）
+_MAX_CHUNKS = 36       # 安全上限（6時間分）
+
+
+def _whisper_one(audio_path: str) -> str:
+    """1ファイルをWhisperで起こす（25MB以内であること）"""
     with open(audio_path, "rb") as f:
-        result = openai_client.audio.transcriptions.create(
+        return openai_client.audio.transcriptions.create(
             model="whisper-1",
             file=f,
             language="ja",
             response_format="text",
         )
-    return result
+
+
+def _transcribe(audio_path: str) -> str:
+    """OpenAI Whisper で日本語文字起こし。
+    Whisperの25MB上限対策として、大きい音声(=長時間)は10分ごとに分割し、
+    各チャンクを起こして連結する。30分は直送、1〜2時間は分割で通る。"""
+    try:
+        size = os.path.getsize(audio_path)
+    except OSError:
+        size = 0
+
+    if size and size <= _WHISPER_DIRECT_LIMIT:
+        return _whisper_one(audio_path)
+
+    logger.info(f"Audio {size} bytes > 直送上限。分割して起こします。")
+    tmpdir = tempfile.mkdtemp(prefix="whisper_chunks_")
+    parts = []
+    try:
+        for i in range(_MAX_CHUNKS):
+            start = i * _CHUNK_SECONDS
+            out = os.path.join(tmpdir, f"chunk_{i:03d}.m4a")
+            # -ss/-t で10分ずつ切り出し、16kHz mono AAC 64k に再エンコード（チャンクを小さく）
+            cmd = [
+                FFMPEG, "-y", "-loglevel", "error",
+                "-ss", str(start), "-t", str(_CHUNK_SECONDS),
+                "-i", audio_path,
+                "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "64k",
+                out,
+            ]
+            subprocess.run(cmd, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 範囲外(=元の長さを超えた)チャンクは中身が無く極小になる → そこで打ち切り
+            if (not os.path.exists(out)) or os.path.getsize(out) < 2048:
+                if os.path.exists(out):
+                    os.remove(out)
+                break
+            parts.append(out)
+
+        if not parts:
+            # 分割に失敗したら最後の手段で直送を試みる
+            return _whisper_one(audio_path)
+
+        logger.info(f"{len(parts)}チャンクに分割。順に文字起こし中。")
+        texts = []
+        for idx, p in enumerate(parts, 1):
+            texts.append(str(_whisper_one(p)).strip())
+            logger.info(f"  chunk {idx}/{len(parts)} 完了")
+        return "\n".join(t for t in texts if t)
+    finally:
+        for p in parts:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
 
 
 def _format_minutes(transcript: str) -> str:
